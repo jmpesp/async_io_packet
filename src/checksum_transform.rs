@@ -30,6 +30,7 @@ fn test_fletcher32() {
 // Prepend a Fletcher32 checksum to the beginning. Note: this is an example of a
 // transform that increases the size of the data, requiring continuation
 // packets.
+#[derive(Debug)]
 pub struct ChecksumPacketDataTransform {}
 
 impl ChecksumPacketDataTransform {
@@ -65,6 +66,22 @@ impl ChecksumPacketDataTransform {
 }
 
 impl PacketDataTransform for ChecksumPacketDataTransform {
+    fn handshaking(&self) -> bool {
+        false
+    }
+
+    fn need_to_start_handshake(&mut self) -> bool {
+        false
+    }
+
+    fn handshake_step(&mut self, _msg: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn handshake_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         self.read_payload(msg)
     }

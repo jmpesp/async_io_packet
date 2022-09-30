@@ -6,6 +6,7 @@ use core::task::Poll;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::convert::TryInto;
+use std::fmt::Debug;
 use std::marker::Unpin;
 
 use anyhow::bail;
@@ -22,7 +23,25 @@ pub use otp_transform::*;
 mod checksum_transform;
 pub use checksum_transform::*;
 
-pub trait PacketDataTransform: Unpin {
+mod noise_transform;
+pub use noise_transform::*;
+
+pub trait PacketDataTransform: Unpin + Debug + Send + Sync {
+    /// If this implementation of PacketDataTransform needs to perform some sort
+    /// of handshake, return true while it is handshaking.
+    fn handshaking(&self) -> bool;
+
+    /// Does this implementation need to start handshaking?
+    fn need_to_start_handshake(&mut self) -> bool;
+
+    /// Drive the transform's handshake by passing in any framed handshake bytes
+    /// received.
+    fn handshake_step(&mut self, msg: &[u8]) -> Result<()>;
+
+    /// Check if there are additional handshake bytes to send, and consume them
+    /// if so.
+    fn handshake_bytes(&mut self) -> Result<Option<Vec<u8>>>;
+
     /// Read received packeted data, optionally apply a transform, and return
     /// a payload buffer.
     fn read_payload(&mut self, msg: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>>;
@@ -30,6 +49,33 @@ pub trait PacketDataTransform: Unpin {
     /// Read a payload, optionally apply a transform, and return a message that
     /// will eventually be sent as packet data.
     fn write_message(&mut self, payload: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>>;
+}
+
+// Blanket implementation for Boxed T
+impl PacketDataTransform for Box<dyn PacketDataTransform> {
+    fn handshaking(&self) -> bool {
+        PacketDataTransform::handshaking(self.as_ref())
+    }
+
+    fn need_to_start_handshake(&mut self) -> bool {
+        PacketDataTransform::need_to_start_handshake(self.as_mut())
+    }
+
+    fn handshake_step(&mut self, msg: &[u8]) -> Result<()> {
+        PacketDataTransform::handshake_step(self.as_mut(), msg)
+    }
+
+    fn handshake_bytes(&mut self) -> Result<Option<Vec<u8>>> {
+        PacketDataTransform::handshake_bytes(self.as_mut())
+    }
+
+    fn read_payload(&mut self, msg: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>> {
+        PacketDataTransform::read_payload(self.as_mut(), msg, cx)
+    }
+
+    fn write_message(&mut self, payload: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>> {
+        PacketDataTransform::write_message(self.as_mut(), payload, cx)
+    }
 }
 
 /// AsyncIoPacket is a layer on top of some object that implements AsyncRead and
@@ -44,12 +90,14 @@ pub struct AsyncIoPacket<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransfo
     /// a container for packets. the last packet in this list may be incomplete
     read_packet_buf: VecDeque<Vec<u8>>,
 
-    /// remaining transformed bytes that need to be flushed
+    /// remaining transformed bytes that need to be read during poll_read
     remaining: Vec<u8>,
 
     // for writes
     write_packet_buf: Vec<Vec<u8>>,
 }
+
+impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> Unpin for AsyncIoPacket<T, U> {}
 
 // Each packet has a maximum size of 65536 bytes.
 const MAX_FRAME_LEN: usize = u16::MAX as usize;
@@ -57,9 +105,20 @@ const MAX_FRAME_LEN: usize = u16::MAX as usize;
 // The first bytes store the data length
 const DATA_LEN: usize = 2;
 
-// The header is the data length, plus a continuation byte
+// The header is the data length, plus a metadata byte
 const HEADER_LEN: usize = DATA_LEN + 1;
-const CONTINUATION_BYTE_OFFSET: usize = DATA_LEN;
+const METADATA_BYTE_OFFSET: usize = DATA_LEN;
+
+const CONTINUATION_FLAG: u8 = 0x01;
+const HANDSHAKE_FLAG: u8 = 0x02;
+
+fn continuation_packet(packet: &[u8]) -> bool {
+    (packet[METADATA_BYTE_OFFSET] & CONTINUATION_FLAG) == CONTINUATION_FLAG
+}
+
+fn handshake_packet(packet: &[u8]) -> bool {
+    (packet[METADATA_BYTE_OFFSET] & HANDSHAKE_FLAG) == HANDSHAKE_FLAG
+}
 
 const MAX_DATA_LEN: usize = MAX_FRAME_LEN - HEADER_LEN;
 
@@ -74,6 +133,42 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncIoPacket<T,
         }
     }
 
+    /// Take chunks out of data and make write packets out of it. set the
+    /// continuation byte on each packet except the last one. Optionally flag
+    /// these packets as handshake packets.
+    fn make_write_packets_from_data(&mut self, data: Vec<u8>, handshake: bool) {
+        for chunk in data.chunks(MAX_DATA_LEN) {
+            // create a new packet
+            let mut packet = vec![0u8; MAX_FRAME_LEN];
+
+            // 1. write out the data length
+            let data_len = chunk.len();
+            assert!((HEADER_LEN + data_len) <= MAX_FRAME_LEN);
+            packet[0..DATA_LEN].copy_from_slice(&u16::to_be_bytes(data_len as u16)[..DATA_LEN]);
+
+            // 2a. set the continuation flag on
+            packet[METADATA_BYTE_OFFSET] |= CONTINUATION_FLAG;
+
+            // 2b. optionally set the handshake flag
+            if handshake {
+                packet[METADATA_BYTE_OFFSET] |= HANDSHAKE_FLAG;
+            }
+
+            // 3. write out packet data
+            packet[HEADER_LEN..(HEADER_LEN + data_len)].copy_from_slice(chunk);
+
+            // 4. truncate and add it to the list of packets
+            self.write_packet_buf
+                .push(packet[..(HEADER_LEN + data_len)].to_vec());
+        }
+
+        // for the last packet, set the continuation flag off
+        if let Some(packet) = self.write_packet_buf.last_mut() {
+            packet[METADATA_BYTE_OFFSET] &= !CONTINUATION_FLAG;
+        }
+    }
+
+    /// Write out as much of what is in `write_packet_buf` as possible.
     fn poll_write_packets_to_io(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<usize>> {
         if self.write_packet_buf.is_empty() {
             // buffer is empty
@@ -120,8 +215,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncIoPacket<T,
                 }
 
                 // notify the executor that this is ready to run, again, because
-                // we have buffered packets
-                if !self.write_packet_buf.is_empty() {
+                // we have either handshaking to do or buffered packets
+                if self.transform.handshaking() || !self.write_packet_buf.is_empty() {
                     cx.waker().wake_by_ref();
                 }
 
@@ -140,6 +235,84 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncRead for As
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut_self = self.get_mut();
+
+        // Before transforming any packet data, check to see if we need to
+        // kick off handshaking. Transforming packet data cannot happen
+        // until the transform's handshake is complete.
+        if mut_self.transform.handshaking() && mut_self.transform.need_to_start_handshake() {
+            // There's no message yet to receive, send &[]
+            mut_self
+                .transform
+                .handshake_step(&[])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+            // If there are handshake bytes to send to the other side, send them
+            if let Some(bytes) = mut_self
+                .transform
+                .handshake_bytes()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+            {
+                // create a new handshake packet(s)
+                mut_self.make_write_packets_from_data(bytes, true);
+
+                // send it out!
+                match mut_self.poll_write_packets_to_io(cx) {
+                    Poll::Pending => {}
+
+                    // If this is incomplete, there will be packets left in
+                    // write_packet_buf. those will get sent out as part of the
+                    // next block of code.
+                    Poll::Ready(Ok(_n)) => {}
+
+                    Poll::Ready(Err(e)) => {
+                        // error writing out handshake bytes
+                        return Poll::Ready(Err(e));
+                    }
+                }
+
+                // we have to return Poll::Pending from this poll_read,
+                // because we've only read handshake bytes, not actual
+                // bytes, and we haven't written anything into buf. notify
+                // the executor that we need to wake up to continue the
+                // handshake.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            } else {
+                // no handshake bytes to send. this usually means the
+                // handshake is done. notify the executor that we need to
+                // wake up to read actual bytes, and return Poll::Pending.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+
+        // If there's still handshake packets to go out, send them out
+        if mut_self.transform.handshaking() {
+            while !mut_self.write_packet_buf.is_empty() {
+                match mut_self.poll_write_packets_to_io(cx) {
+                    Poll::Pending => {
+                        // We wrote out as much as we could. Return Pending, but
+                        // we still need to be woken up to continue the
+                        // handshake.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+
+                    Poll::Ready(Ok(_n)) => {
+                        // continue looping to write all the handshake packets
+                        // out
+                    }
+
+                    Poll::Ready(Err(e)) => {
+                        // error writing out handshake bytes
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            }
+        }
+
+        // Fill input buf by polling the underlying io object, then turn those
+        // into packets.
 
         let mut input_bytes = vec![0u8; MAX_FRAME_LEN];
         let mut input_buf = tokio::io::ReadBuf::new(&mut input_bytes);
@@ -162,13 +335,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncRead for As
 
         // if FRAME_LEN_BYTES is 4, each complete packet looks like:
         //
-        //    [len|c|.....data.....]
+        //    [len|m|.....data.....]
         //    0   4 5              n
         //
         // where n = 5 + len.
         //
-        // the data length is first, followed by a continuation byte: 0x01 means
-        // continue.
+        // the data length is first, followed by a metadata byte:
+        //
+        // - 0x01 is the continuation flag
+        // - 0x02 is the handshake flag
         //
         // the last packet in read_packet_buf may contain a partial packet from
         // the last read - append to it, optionally creating a new packet(s).
@@ -284,12 +459,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncRead for As
             bytes_written = true;
         }
 
-        // Transform packet data, and write it to the output buf
+        // Pass packeted data to the transform. Optionally, write to the output
+        // buf.
         'outer: while !mut_self.read_packet_buf.is_empty() {
             // accumulate packet data, taking into account continuation bytes
             let mut msg: Vec<u8> = Vec::with_capacity(MAX_FRAME_LEN);
             let mut packets = 0;
             let mut saw_all_packets = false;
+            let mut handshaking_flag: Vec<bool> = vec![];
 
             for packet in mut_self.read_packet_buf.iter() {
                 // check for incomplete packets
@@ -314,54 +491,125 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncRead for As
                 msg.extend_from_slice(&packet[HEADER_LEN..]);
                 packets += 1;
 
+                // record if this packet had handshaking flag
+                handshaking_flag.push(handshake_packet(packet));
+
                 // now check to see if the continuation is set. if it is, continue
-                // to the next packet. if it's not, break here
-                if packet[CONTINUATION_BYTE_OFFSET] == 0x00 {
+                // to the next packet. if it's not, break here.
+                if !continuation_packet(packet) {
                     saw_all_packets = true;
                     break;
                 }
             }
 
+            // Bail early if we haven't seen a non-continuation packet
             if !saw_all_packets {
                 break;
             }
 
-            // if it's not, apply the transform to the whole message
-            match mut_self.transform.read_payload(&msg, cx) {
-                Ok(payload) => {
-                    // write payload into output buf
-                    if buf.remaining() < payload.len() {
-                        // there isn't enough room in buf for all the payload
-                        // bytes! write what we can, then store the rest at the
-                        // end of `remaining`
-                        let cutoff = buf.remaining();
-
-                        buf.put_slice(&payload[..cutoff]);
-
-                        let (_, remaining) = payload.split_at(cutoff);
-                        mut_self.remaining.extend_from_slice(remaining);
-
-                        // drop the packets we read, it only contains
-                        // untransformed data, and the rest of the transformed
-                        // data is in `remaining`
-                        mut_self.read_packet_buf.drain(0..packets);
-
-                        // we have to return here, buf is now full.
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    assert!(buf.remaining() >= payload.len());
-                    buf.put_slice(&payload);
-                    mut_self.read_packet_buf.drain(0..packets);
-
-                    bytes_written = true;
-                }
-
-                Err(e) => {
+            // Before transforming any packet data, check to see if we're
+            // handshaking still. Transforming packet data cannot happen until
+            // the transform's handshake is complete.
+            if mut_self.transform.handshaking() {
+                // If we're still handshaking, expect that each packet we've
+                // seen is a handshake packet, and that the other side of this
+                // communication is buffering actual data.
+                if !handshaking_flag.iter().all(|x| *x) {
+                    // if not, this is a bug.
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        e,
+                        "During handshaking, not all packets were handshake packets!",
                     )));
+                }
+
+                // Pass this to the transform as a handshake response
+                mut_self.transform.handshake_step(&msg).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+
+                // Drop the packets we read, we consumed the handshake bytes
+                mut_self.read_packet_buf.drain(0..packets);
+
+                if let Some(bytes) = mut_self.transform.handshake_bytes().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })? {
+                    // create a new handshake packet(s)
+                    mut_self.make_write_packets_from_data(bytes, true);
+
+                    // send it out!
+                    match mut_self.poll_write_packets_to_io(cx) {
+                        Poll::Pending => {}
+
+                        Poll::Ready(Ok(_n)) => {
+                            // If this is incomplete, the next round will send
+                            // it out.
+                        }
+
+                        Poll::Ready(Err(e)) => {
+                            // error writing out handshake bytes
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+
+                    // we have to return Poll::Pending from this poll_read,
+                    // because we've only read and written handshake bytes, not
+                    // actual bytes, and we haven't written anything into buf.
+                    // notify the executor that we need to wake up to continue
+                    // the handshake.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                } else {
+                    // no handshake bytes to send. this usually means the
+                    // handshake is done. notify the executor that we need to
+                    // wake up to read actual bytes, and return Poll::Pending.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            } else {
+                // No longer handshaking - apply the transform to the whole message
+                if handshaking_flag.iter().any(|x| *x) {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Not handshaking but saw handshake packets!",
+                    )));
+                }
+
+                match mut_self.transform.read_payload(&msg, cx) {
+                    Ok(payload) => {
+                        // write payload into output buf
+                        if buf.remaining() < payload.len() {
+                            // there isn't enough room in buf for all the payload
+                            // bytes! write what we can, then store the rest at the
+                            // end of `remaining`
+                            let cutoff = buf.remaining();
+
+                            buf.put_slice(&payload[..cutoff]);
+
+                            let (_, remaining) = payload.split_at(cutoff);
+                            mut_self.remaining.extend_from_slice(remaining);
+
+                            // drop the packets we read, it only contains
+                            // untransformed data, and the rest of the transformed
+                            // data is in `remaining`
+                            mut_self.read_packet_buf.drain(0..packets);
+
+                            // we have to return here, buf is now full.
+                            return Poll::Ready(Ok(()));
+                        }
+
+                        assert!(buf.remaining() >= payload.len());
+                        buf.put_slice(&payload);
+                        mut_self.read_packet_buf.drain(0..packets);
+
+                        bytes_written = true;
+                    }
+
+                    Err(e) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e,
+                        )));
+                    }
                 }
             }
         }
@@ -369,9 +617,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncRead for As
         if bytes_written {
             Poll::Ready(Ok(()))
         } else {
-            if !mut_self.read_packet_buf.is_empty() {
+            if mut_self.transform.handshaking() || !mut_self.read_packet_buf.is_empty() {
                 // notify the executor that this is ready to run, again, because
-                // we have buffered packets with untransformed data
+                // we have either handshaking to do or buffered packets with
+                // untransformed data
                 cx.waker().wake_by_ref();
             }
 
@@ -386,11 +635,40 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncWrite for A
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        let mut mut_self = self.get_mut();
+
+        if mut_self.transform.handshaking() {
+            // If we're still handshaking, we can't transform any bytes yet.
+            // Either kick off or continue the handshake. `poll_read` drives the
+            // handshake, so call it here.
+            let mut bytes = vec![0u8; 65536];
+            let mut rb = tokio::io::ReadBuf::new(&mut bytes);
+            let result = Pin::new(&mut mut_self).poll_read(cx, &mut rb);
+
+            // `poll_read` will not return any data while handshaking
+            assert!(rb.filled().is_empty());
+
+            return match result {
+                Poll::Pending => {
+                    // need to wake up to continue handshake
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+
+                Poll::Ready(Ok(())) => {
+                    // We're still handshaking, or we're ready to actually
+                    // write. Either way, return Pending,
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            };
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-
-        let mut_self = self.get_mut();
 
         // transform the whole buf into a message
         let msg = match mut_self.transform.write_message(buf, cx) {
@@ -400,33 +678,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncWrite for A
             }
         };
 
-        // take chunks out of buf, make packets out of it. set the continuation
-        // byte on each packet except the last one.
-        for chunk in msg.chunks(MAX_DATA_LEN) {
-            // create a new packet
-            let mut packet = vec![0u8; MAX_FRAME_LEN];
-
-            // 1. write out the data length
-            let data_len = chunk.len();
-            assert!((HEADER_LEN + data_len) <= MAX_FRAME_LEN);
-            packet[0..DATA_LEN].copy_from_slice(&u16::to_be_bytes(data_len as u16)[..DATA_LEN]);
-
-            // 2. set the continuation byte on
-            packet[CONTINUATION_BYTE_OFFSET] = 0x01;
-
-            // 3. write out packet data
-            packet[HEADER_LEN..(HEADER_LEN + data_len)].copy_from_slice(chunk);
-
-            // 4. truncate and add it to the list of packets
-            mut_self
-                .write_packet_buf
-                .push(packet[..(HEADER_LEN + data_len)].to_vec());
-        }
-
-        // for the last packet, set the continuation byte to 0x00
-        if let Some(packet) = mut_self.write_packet_buf.last_mut() {
-            packet[CONTINUATION_BYTE_OFFSET] = 0x00;
-        }
+        mut_self.make_write_packets_from_data(msg, false);
 
         // write out as much packet data as we can
         match mut_self.poll_write_packets_to_io(cx) {

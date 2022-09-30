@@ -1,17 +1,18 @@
 // Copyright 2022 Oxide Computer Company
 
+use std::marker::Unpin;
+
 use anyhow::Result;
 use rand::Rng;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 
-use async_io_packet::AsyncIoPacket;
 use async_io_packet::PacketDataTransform;
 
 use async_io_packet::ChecksumPacketDataTransform;
+use async_io_packet::NoisePacketDataTransform;
 use async_io_packet::NoopPacketDataTransform;
 use async_io_packet::OtpPacketDataTransform;
 
@@ -119,49 +120,35 @@ async fn test_junk_data_if_otp_seed_mismatch() -> Result<()> {
 #[tokio::test]
 async fn the_whole_point_is_layering_these_things() -> Result<()> {
     // create many layers of transforms, test data transiting through it
+    let tf = TestFramework::new_with_layers(
+        [
+            Box::new(ChecksumPacketDataTransform {}) as Box<dyn PacketDataTransform + Send>,
+            Box::new(OtpPacketDataTransform::<rand::rngs::StdRng>::new(
+                6243752233550921728,
+            )),
+            Box::new(ChecksumPacketDataTransform {}),
+            Box::new(OtpPacketDataTransform::<rand::rngs::StdRng>::new(
+                721716561223421579,
+            )),
+            Box::new(ChecksumPacketDataTransform {}),
+        ]
+        .into_iter(),
+        [
+            Box::new(ChecksumPacketDataTransform {}) as Box<dyn PacketDataTransform + Send>,
+            Box::new(OtpPacketDataTransform::<rand::rngs::StdRng>::new(
+                6243752233550921728,
+            )),
+            Box::new(ChecksumPacketDataTransform {}),
+            Box::new(OtpPacketDataTransform::<rand::rngs::StdRng>::new(
+                721716561223421579,
+            )),
+            Box::new(ChecksumPacketDataTransform {}),
+        ]
+        .into_iter(),
+    )
+    .await?;
 
-    // create the server
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-
-    let server_join_handle: JoinHandle<Result<_>> = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await?;
-        let server = AsyncIoPacket::new(
-            AsyncIoPacket::new(
-                AsyncIoPacket::new(
-                    AsyncIoPacket::new(
-                        AsyncIoPacket::new(socket, ChecksumPacketDataTransform {}),
-                        OtpPacketDataTransform::<rand::rngs::StdRng>::new(6243752233550921728),
-                    ),
-                    ChecksumPacketDataTransform {},
-                ),
-                OtpPacketDataTransform::<rand::rngs::StdRng>::new(721716561223421579),
-            ),
-            ChecksumPacketDataTransform {},
-        );
-        Ok(server)
-    });
-
-    let client_join_handle: JoinHandle<Result<_>> = tokio::spawn(async move {
-        let stream = TcpStream::connect(addr).await?;
-        let client = AsyncIoPacket::new(
-            AsyncIoPacket::new(
-                AsyncIoPacket::new(
-                    AsyncIoPacket::new(
-                        AsyncIoPacket::new(stream, ChecksumPacketDataTransform {}),
-                        OtpPacketDataTransform::<rand::rngs::StdRng>::new(6243752233550921728),
-                    ),
-                    ChecksumPacketDataTransform {},
-                ),
-                OtpPacketDataTransform::<rand::rngs::StdRng>::new(721716561223421579),
-            ),
-            ChecksumPacketDataTransform {},
-        );
-        Ok(client)
-    });
-
-    let mut client = client_join_handle.await??;
-    let mut server = server_join_handle.await??;
+    let (mut client, mut server) = tf.consume();
 
     // client -> server
 
@@ -201,6 +188,171 @@ async fn the_whole_point_is_layering_these_things() -> Result<()> {
     server.read_exact(&mut actual).await?;
 
     assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+async fn client_action<T: AsyncRead + AsyncWrite + Unpin>(mut client: T) -> Result<()> {
+    let _n = client.write(&vec![0xFFu8; 1024]).await?;
+    client.flush().await?;
+    Ok(())
+}
+
+async fn server_action<T: AsyncRead + AsyncWrite + Unpin>(mut server: T) -> Result<()> {
+    let mut buf = vec![0u8; 1024];
+    let n = server.read_exact(&mut buf).await?;
+
+    assert_eq!(n, 1024);
+    assert_eq!(vec![0xFFu8; 1024], buf);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_noise_basic() -> Result<()> {
+    let client = NoisePacketDataTransform::client(&[255u8; 32])?;
+    let server = NoisePacketDataTransform::server(&[255u8; 32])?;
+
+    let tf = TestFramework::new(client, server).await?;
+
+    let (client, server) = tf.consume();
+
+    let server_join_handle = tokio::spawn(server_action(server));
+    let client_join_handle = tokio::spawn(client_action(client));
+
+    server_join_handle.await??;
+    client_join_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_noise_with_checksum() -> Result<()> {
+    let key = {
+        let mut buf = vec![0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    let tf = TestFramework::new_with_layers(
+        [
+            Box::new(NoisePacketDataTransform::client(&key)?)
+                as Box<dyn PacketDataTransform + Send>,
+            Box::new(ChecksumPacketDataTransform {}),
+        ]
+        .into_iter(),
+        [
+            Box::new(NoisePacketDataTransform::server(&key)?)
+                as Box<dyn PacketDataTransform + Send>,
+            Box::new(ChecksumPacketDataTransform {}),
+        ]
+        .into_iter(),
+    )
+    .await?;
+
+    let (client, server) = tf.consume();
+
+    let server_join_handle = tokio::spawn(server_action(server));
+    let client_join_handle = tokio::spawn(client_action(client));
+
+    server_join_handle.await??;
+    client_join_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_double_noise_all_the_way_across_the_sky() -> Result<()> {
+    let key1 = {
+        let mut buf = vec![0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    let key2 = {
+        let mut buf = vec![0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    let tf = TestFramework::new_with_layers(
+        [
+            Box::new(NoisePacketDataTransform::client(&key1)?)
+                as Box<dyn PacketDataTransform + Send>,
+            Box::new(NoisePacketDataTransform::client(&key2)?),
+        ]
+        .into_iter(),
+        [
+            Box::new(NoisePacketDataTransform::server(&key1)?)
+                as Box<dyn PacketDataTransform + Send>,
+            Box::new(NoisePacketDataTransform::server(&key2)?),
+        ]
+        .into_iter(),
+    )
+    .await?;
+
+    let (client, server) = tf.consume();
+
+    let server_join_handle = tokio::spawn(server_action(server));
+    let client_join_handle = tokio::spawn(client_action(client));
+
+    server_join_handle.await??;
+    client_join_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_its_starting_to_look_like_triple_noise() -> Result<()> {
+    let key1 = {
+        let mut buf = vec![0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    let key2 = {
+        let mut buf = vec![0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    let key3 = {
+        let mut buf = vec![0u8; 32];
+        let mut rng = rand::thread_rng();
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    let tf = TestFramework::new_with_layers(
+        [
+            Box::new(NoisePacketDataTransform::client(&key1)?)
+                as Box<dyn PacketDataTransform + Send>,
+            Box::new(NoisePacketDataTransform::client(&key2)?),
+            Box::new(NoisePacketDataTransform::client(&key3)?),
+        ]
+        .into_iter(),
+        [
+            Box::new(NoisePacketDataTransform::server(&key1)?)
+                as Box<dyn PacketDataTransform + Send>,
+            Box::new(NoisePacketDataTransform::server(&key2)?),
+            Box::new(NoisePacketDataTransform::server(&key3)?),
+        ]
+        .into_iter(),
+    )
+    .await?;
+
+    let (client, server) = tf.consume();
+
+    let server_join_handle = tokio::spawn(server_action(server));
+    let client_join_handle = tokio::spawn(client_action(client));
+
+    server_join_handle.await??;
+    client_join_handle.await??;
 
     Ok(())
 }
