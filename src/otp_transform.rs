@@ -19,7 +19,7 @@ impl<T: Rng + SeedableRng + Unpin> OtpPacketDataTransform<T> {
 }
 
 impl<T: Rng + SeedableRng + Unpin> PacketDataTransform for OtpPacketDataTransform<T> {
-    fn read_payload(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+    fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         let mut payload = vec![0u8; msg.len()];
         for i in 0..msg.len() {
             payload[i] = msg[i] ^ self.rng.gen::<u8>();
@@ -27,7 +27,7 @@ impl<T: Rng + SeedableRng + Unpin> PacketDataTransform for OtpPacketDataTransfor
         Ok(payload)
     }
 
-    fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+    fn write_message(&mut self, payload: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         let mut msg = vec![0u8; payload.len()];
         for i in 0..payload.len() {
             msg[i] = payload[i] ^ self.rng.gen::<u8>();

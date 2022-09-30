@@ -6,11 +6,11 @@ use super::*;
 pub struct NoopPacketDataTransform {}
 
 impl PacketDataTransform for NoopPacketDataTransform {
-    fn read_payload(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+    fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         Ok(msg.to_vec())
     }
 
-    fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+    fn write_message(&mut self, payload: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         Ok(payload.to_vec())
     }
 }

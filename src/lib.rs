@@ -25,11 +25,11 @@ pub use checksum_transform::*;
 pub trait PacketDataTransform: Unpin {
     /// Read received packeted data, optionally apply a transform, and return
     /// a payload buffer.
-    fn read_payload(&mut self, msg: &[u8]) -> Result<Vec<u8>>;
+    fn read_payload(&mut self, msg: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>>;
 
     /// Read a payload, optionally apply a transform, and return a message that
     /// will eventually be sent as packet data.
-    fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
+    fn write_message(&mut self, payload: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>>;
 }
 
 /// AsyncIoPacket is a layer on top of some object that implements AsyncRead and
@@ -327,7 +327,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncRead for As
             }
 
             // if it's not, apply the transform to the whole message
-            match mut_self.transform.read_payload(&msg) {
+            match mut_self.transform.read_payload(&msg, cx) {
                 Ok(payload) => {
                     // write payload into output buf
                     if buf.remaining() < payload.len() {
@@ -393,7 +393,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncWrite for A
         let mut_self = self.get_mut();
 
         // transform the whole buf into a message
-        let msg = match mut_self.transform.write_message(buf) {
+        let msg = match mut_self.transform.write_message(buf, cx) {
             Ok(msg) => msg,
             Err(e) => {
                 return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));

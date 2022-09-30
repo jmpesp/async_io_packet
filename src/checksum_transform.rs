@@ -2,11 +2,6 @@
 
 use super::*;
 
-// Prepend a Fletcher32 checksum to the beginning. Note: this is an example of a
-// transform that increases the size of the data, requiring continuation
-// packets.
-pub struct ChecksumPacketDataTransform {}
-
 // from https://en.wikipedia.org/wiki/Fletcher%27s_checksum
 fn fletcher32(data: &[u8]) -> u32 {
     let mut sum1: u32 = 0;
@@ -32,7 +27,12 @@ fn test_fletcher32() {
     assert_eq!(fletcher32("abcdefgh".as_bytes()), 3957429649);
 }
 
-impl PacketDataTransform for ChecksumPacketDataTransform {
+// Prepend a Fletcher32 checksum to the beginning. Note: this is an example of a
+// transform that increases the size of the data, requiring continuation
+// packets.
+pub struct ChecksumPacketDataTransform {}
+
+impl ChecksumPacketDataTransform {
     fn read_payload(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         if msg.len() < 4 {
             bail!("no prepended checksum!");
@@ -61,6 +61,16 @@ impl PacketDataTransform for ChecksumPacketDataTransform {
         msg[4..].copy_from_slice(payload);
 
         Ok(msg)
+    }
+}
+
+impl PacketDataTransform for ChecksumPacketDataTransform {
+    fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
+        self.read_payload(msg)
+    }
+
+    fn write_message(&mut self, payload: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
+        self.write_message(payload)
     }
 }
 
