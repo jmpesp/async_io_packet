@@ -2,9 +2,12 @@
 
 use super::*;
 
-/// A no-op PacketDataTransform does nothing except copy bytes
+/// A no-op PacketDataTransform does nothing except copy bytes. Optionally, it
+/// has a max payload length.
 #[derive(Debug)]
-pub struct NoopPacketDataTransform {}
+pub struct NoopPacketDataTransform {
+    pub max_payload_length: Option<usize>,
+}
 
 impl PacketDataTransform for NoopPacketDataTransform {
     fn handshaking(&self) -> bool {
@@ -24,7 +27,7 @@ impl PacketDataTransform for NoopPacketDataTransform {
     }
 
     fn max_payload_bytes(&self) -> Option<usize> {
-        None
+        self.max_payload_length
     }
 
     fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {

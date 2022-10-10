@@ -3,6 +3,7 @@
 use std::marker::Unpin;
 
 use anyhow::Result;
+use rand::thread_rng;
 use rand::Rng;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -50,7 +51,15 @@ async fn test_library_transform<T: PacketDataTransform + Send + 'static>(
 
 #[tokio::test]
 async fn test_library_transforms() -> Result<()> {
-    test_library_transform(NoopPacketDataTransform {}, NoopPacketDataTransform {}).await?;
+    test_library_transform(
+        NoopPacketDataTransform {
+            max_payload_length: None,
+        },
+        NoopPacketDataTransform {
+            max_payload_length: None,
+        },
+    )
+    .await?;
 
     test_library_transform(
         OtpPacketDataTransform::<rand::rngs::StdRng>::new(3283870128904943616),
@@ -63,6 +72,9 @@ async fn test_library_transforms() -> Result<()> {
         ChecksumPacketDataTransform {},
     )
     .await?;
+
+    // Note: skip testing NoisePacketDataTransform here, it doesn't work without
+    // spawning multiple threads.
 
     Ok(())
 }
@@ -87,8 +99,25 @@ async fn test_library_transform_max_bytes<T: PacketDataTransform + Send + 'stati
 
 #[tokio::test]
 async fn test_library_transforms_max_bytes() -> Result<()> {
-    test_library_transform_max_bytes(NoopPacketDataTransform {}, NoopPacketDataTransform {})
-        .await?;
+    test_library_transform_max_bytes(
+        NoopPacketDataTransform {
+            max_payload_length: None,
+        },
+        NoopPacketDataTransform {
+            max_payload_length: None,
+        },
+    )
+    .await?;
+
+    test_library_transform_max_bytes(
+        NoopPacketDataTransform {
+            max_payload_length: Some(1024),
+        },
+        NoopPacketDataTransform {
+            max_payload_length: Some(1024),
+        },
+    )
+    .await?;
 
     test_library_transform_max_bytes(
         OtpPacketDataTransform::<rand::rngs::StdRng>::new(6243752233550921728),
@@ -366,6 +395,26 @@ async fn test_its_starting_to_look_like_triple_noise() -> Result<()> {
         .into_iter(),
     )
     .await?;
+
+    let (client, server) = tf.consume();
+
+    let server_join_handle = tokio::spawn(server_action(server));
+    let client_join_handle = tokio::spawn(client_action(client));
+
+    server_join_handle.await??;
+    client_join_handle.await??;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_otp_with_handshake() -> Result<()> {
+    let seed: u64 = thread_rng().gen::<u64>();
+
+    let client = OtpPacketDataTransform::<rand::rngs::StdRng>::client(seed);
+    let server = OtpPacketDataTransform::<rand::rngs::StdRng>::server(seed);
+
+    let tf = TestFramework::new(client, server).await?;
 
     let (client, server) = tf.consume();
 
