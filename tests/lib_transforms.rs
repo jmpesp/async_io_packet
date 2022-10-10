@@ -24,6 +24,7 @@ async fn test_library_transform<T: PacketDataTransform + Send + 'static>(
 ) -> Result<()> {
     let mut tf = TestFramework::new(client, server).await?;
 
+    // Send and receive a small message
     let n = tf
         .client
         .write("test post please ignore".as_bytes())
@@ -31,10 +32,18 @@ async fn test_library_transform<T: PacketDataTransform + Send + 'static>(
     assert_eq!(n, "test post please ignore".len());
 
     let mut buf = vec![0u8; u16::MAX as usize];
-
     let n = tf.server.read(&mut buf).await?;
+    assert_eq!(&buf[0..n], "test post please ignore".as_bytes());
 
-    assert_eq!(&buf[0..n], "test post please ignore".as_bytes(),);
+    // Send and receive a giant message
+    let _n = tf.server.write(&vec![0xFFu8; u16::MAX as usize]).await?;
+    tf.server.flush().await?;
+
+    let mut buf = vec![0u8; u16::MAX as usize];
+    let n = tf.client.read_exact(&mut buf).await?;
+
+    assert_eq!(n, u16::MAX as usize);
+    assert_eq!(buf[0..n], vec![0xFFu8; u16::MAX as usize]);
 
     Ok(())
 }
@@ -64,16 +73,14 @@ async fn test_library_transform_max_bytes<T: PacketDataTransform + Send + 'stati
 ) -> Result<()> {
     let mut tf = TestFramework::new(client, server).await?;
 
-    let _n = tf.client.write(&vec![0xFFu8; u16::MAX as usize]).await?;
+    let n = tf.client.write(&vec![0xFFu8; u16::MAX as usize]).await?;
+    assert_eq!(n, u16::MAX as usize);
     tf.client.flush().await?;
 
     let mut buf = vec![0u8; u16::MAX as usize];
-
     let n = tf.server.read_exact(&mut buf).await?;
-
     assert_eq!(n, u16::MAX as usize);
-
-    assert_eq!(buf[0..n], vec![0xFFu8; u16::MAX as usize],);
+    assert_eq!(buf[0..n], vec![0xFFu8; u16::MAX as usize]);
 
     Ok(())
 }
@@ -105,12 +112,12 @@ async fn test_junk_data_if_otp_seed_mismatch() -> Result<()> {
 
     let mut tf = TestFramework::new(client, server).await?;
 
-    let _n = tf.client.write(&vec![0xFFu8; 1024]).await?;
+    let n = tf.client.write(&vec![0xFFu8; 1024]).await?;
+    assert_eq!(n, 1024);
     tf.client.flush().await?;
 
     let mut buf = vec![0u8; 1024];
     let n = tf.server.read_exact(&mut buf).await?;
-
     assert_eq!(n, 1024);
     assert_ne!(vec![0xFFu8; 1024], buf);
 
@@ -193,17 +200,31 @@ async fn the_whole_point_is_layering_these_things() -> Result<()> {
 }
 
 async fn client_action<T: AsyncRead + AsyncWrite + Unpin>(mut client: T) -> Result<()> {
-    let _n = client.write(&vec![0xFFu8; 1024]).await?;
+    // Send 1024 bytes
+    let n = client.write(&vec![0xFFu8; 1024]).await?;
+    assert_eq!(n, 1024);
     client.flush().await?;
+
+    // Receive max bytes
+    let mut buf = vec![0u8; u16::MAX as usize];
+    let n = client.read_exact(&mut buf).await?;
+    assert_eq!(n, u16::MAX as usize);
+    assert_eq!(buf[0..n], vec![0xFFu8; u16::MAX as usize]);
+
     Ok(())
 }
 
 async fn server_action<T: AsyncRead + AsyncWrite + Unpin>(mut server: T) -> Result<()> {
+    // Receive 1024 bytes
     let mut buf = vec![0u8; 1024];
     let n = server.read_exact(&mut buf).await?;
-
     assert_eq!(n, 1024);
     assert_eq!(vec![0xFFu8; 1024], buf);
+
+    // Send max bytes
+    let n = server.write(&vec![0xFFu8; u16::MAX as usize]).await?;
+    assert_eq!(n, u16::MAX as usize);
+    server.flush().await?;
 
     Ok(())
 }

@@ -42,6 +42,10 @@ pub trait PacketDataTransform: Unpin + Debug + Send + Sync {
     /// if so.
     fn handshake_bytes(&mut self) -> Result<Option<Vec<u8>>>;
 
+    /// Maximum number of bytes that can be transformed at any one time, if
+    /// applicable.
+    fn max_payload_bytes(&self) -> Option<usize>;
+
     /// Read received packeted data, optionally apply a transform, and return
     /// a payload buffer.
     fn read_payload(&mut self, msg: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>>;
@@ -67,6 +71,10 @@ impl PacketDataTransform for Box<dyn PacketDataTransform> {
 
     fn handshake_bytes(&mut self) -> Result<Option<Vec<u8>>> {
         PacketDataTransform::handshake_bytes(self.as_mut())
+    }
+
+    fn max_payload_bytes(&self) -> Option<usize> {
+        PacketDataTransform::max_payload_bytes(self.as_ref())
     }
 
     fn read_payload(&mut self, msg: &[u8], cx: &mut Context<'_>) -> Result<Vec<u8>> {
@@ -670,15 +678,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin, U: PacketDataTransform> AsyncWrite for A
             return Poll::Ready(Ok(0));
         }
 
-        // transform the whole buf into a message
-        let msg = match mut_self.transform.write_message(buf, cx) {
-            Ok(msg) => msg,
-            Err(e) => {
-                return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-            }
+        // Some transforms have a maximum number of payload bytes that they can
+        // operate on at once. Honour that here if applicable.
+        let max_data_len = if let Some(max_bytes) = mut_self.transform.max_payload_bytes() {
+            std::cmp::min(max_bytes, MAX_DATA_LEN)
+        } else {
+            MAX_DATA_LEN
         };
 
-        mut_self.make_write_packets_from_data(msg, false);
+        for sub_buf in buf.chunks(max_data_len) {
+            // transform the sub-buffer into a message
+            let msg = match mut_self.transform.write_message(sub_buf, cx) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                }
+            };
+
+            mut_self.make_write_packets_from_data(msg, false);
+        }
 
         // write out as much packet data as we can
         match mut_self.poll_write_packets_to_io(cx) {

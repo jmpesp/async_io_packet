@@ -23,6 +23,10 @@ impl PacketDataTransform for NoopPacketDataTransform {
         Ok(None)
     }
 
+    fn max_payload_bytes(&self) -> Option<usize> {
+        None
+    }
+
     fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         Ok(msg.to_vec())
     }

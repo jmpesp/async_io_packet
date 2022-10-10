@@ -254,6 +254,17 @@ impl PacketDataTransform for NoisePacketDataTransform {
         }
     }
 
+    fn max_payload_bytes(&self) -> Option<usize> {
+        // In the snow crate's src/constants.rs:
+        //
+        //     TAG_LEN = 16
+        //     MAXMSGLEN = 65535
+        //
+        // truncate the maximum payload that this transform can do based on
+        // these
+        Some(65535 - 16)
+    }
+
     fn read_payload(&mut self, msg: &[u8], _cx: &mut Context<'_>) -> Result<Vec<u8>> {
         match &mut self.noise_state {
             NoiseState::Invalid => {
